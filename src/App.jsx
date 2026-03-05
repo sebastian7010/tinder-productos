@@ -16,6 +16,12 @@ function makeReviewerId() {
   return v;
 }
 
+function resolveReviewerId() {
+  const fromQuery = qparam("reviewer").trim();
+  if (fromQuery) return fromQuery;
+  return makeReviewerId();
+}
+
 function isInvalidTitle(value) {
   const text = `${value || ""}`.replace(/\s+/g, " ").trim();
   if (!text) return true;
@@ -190,7 +196,7 @@ function getActionTarget(action) {
 
 export default function App() {
   const [sessionId, setSessionId] = useState(() => qparam("session") || "herramientas-bogota");
-  const reviewerId = useMemo(() => makeReviewerId(), []);
+  const reviewerId = useMemo(() => resolveReviewerId(), []);
 
   const [items, setItems] = useState([]);
   const [index, setIndex] = useState(0);
@@ -217,7 +223,7 @@ export default function App() {
   }, [items.length, remaining]);
   const currentImage = current?.images?.[imageIndex] || null;
   const currentImageOpenUrl = current?.imageOriginalUrl || currentImage || current?.url || "";
-  const shareUrl = `${window.location.origin}${window.location.pathname}?session=${encodeURIComponent(sessionId)}`;
+  const shareUrl = `${window.location.origin}${window.location.pathname}?session=${encodeURIComponent(sessionId)}&reviewer=${encodeURIComponent(reviewerId)}`;
   const isLocalOnlyHost = /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
 
   const loadProducts = useCallback(async () => {
@@ -303,14 +309,33 @@ export default function App() {
     return items.filter((it) => selected.has(it.id)).map((it) => it.raw);
   }
 
-  function exportDecisions(decisionKind) {
-    const out = getDecisionItems(decisionKind);
-    downloadJson(createExportFilename(sessionId, reviewerId, decisionKind), out);
+  async function fetchRemoteDecisionItems(decisionKind) {
+    const endpoint = `/api/exports?session=${encodeURIComponent(sessionId)}&reviewer=${encodeURIComponent(reviewerId)}&type=${decisionKind}`;
+    const response = await fetch(endpoint, { cache: "no-store" });
+    if (!response.ok) throw new Error(`API ${response.status}`);
+
+    const payload = await response.json();
+    if (decisionKind === "keep") return Array.isArray(payload.accepted) ? payload.accepted : [];
+    return Array.isArray(payload.rejected) ? payload.rejected : [];
   }
 
-  function exportAllDecisions() {
-    exportDecisions("keep");
-    exportDecisions("drop");
+  async function exportDecisions(decisionKind) {
+    try {
+      const remoteItems = await fetchRemoteDecisionItems(decisionKind);
+      downloadJson(createExportFilename(sessionId, reviewerId, decisionKind), remoteItems);
+      setPersistenceMode("server");
+      return;
+    } catch {
+      // Si no hay backend remoto disponible, exportamos local.
+    }
+
+    const localItems = getDecisionItems(decisionKind);
+    downloadJson(createExportFilename(sessionId, reviewerId, decisionKind), localItems);
+  }
+
+  async function exportAllDecisions() {
+    await exportDecisions("keep");
+    await exportDecisions("drop");
   }
 
   function applyDecisionState(id, action) {
@@ -494,6 +519,7 @@ export default function App() {
                   <span style={styles.badge}>Keep: {accepted.size}</span>
                   <span style={styles.badge}>Drop: {rejected.size}</span>
                   <span style={styles.badge}>Restantes: {remaining}</span>
+                  <span style={styles.badge}>Reviewer: {reviewerId}</span>
                   <span style={styles.badge}>Guardado: {persistenceMode === "server" ? "archivo" : "local"}</span>
                 </div>
 
@@ -568,7 +594,7 @@ export default function App() {
                         target="_blank"
                         rel="noreferrer"
                         style={styles.imageLink}
-                        title="Abrir imagen en una pestaña nueva"
+                        title="Abrir imagen en una pestana nueva"
                       >
                         <img
                           src={currentImage}

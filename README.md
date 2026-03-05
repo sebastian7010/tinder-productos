@@ -1,16 +1,45 @@
-# React + Vite
+# Tinder de productos
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+App de revision tipo swipe para catalogos de productos.
 
-Currently, two official plugins are available:
+## Guardado remoto en Vercel
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+La app usa estas APIs serverless:
 
-## React Compiler
+- `GET/PUT /api/session-state` para guardar decisiones.
+- `GET /api/exports` para obtener JSON remotos.
+- `GET /api/health` para validar conexion.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### 1) Crear tabla en Supabase
 
-## Expanding the ESLint configuration
+Ejecuta el SQL:
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+- [`supabase/review_states.sql`](./supabase/review_states.sql)
+
+### 2) Variables de entorno en Vercel
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+### 3) Compartir link con reviewer fijo
+
+Comparte con `session` y `reviewer`:
+
+`https://tu-app.vercel.app/?session=herramientas-bogota&reviewer=kevin`
+
+### 4) Descargar JSON remoto
+
+Aceptados:
+
+`https://tu-app.vercel.app/api/exports?session=herramientas-bogota&reviewer=kevin&type=keep&download=1`
+
+Rechazados:
+
+`https://tu-app.vercel.app/api/exports?session=herramientas-bogota&reviewer=kevin&type=drop&download=1`
+
+## Desarrollo local
+
+```bash
+npm install
+npm run dev
+```
