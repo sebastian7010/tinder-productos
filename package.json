@@ -7,7 +7,13 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "catalog:images": "node scripts/generate-local-catalog.mjs",
+    "catalog:repeats": "node scripts/split-repeated-images.mjs",
+    "catalog:dedupe": "node scripts/dedupe-catalog-images.mjs",
+    "remote:server": "node scripts/remote-review-server.mjs",
+    "remote:start": "npm run build && node scripts/remote-review-server.mjs",
+    "remote:public": "node scripts/start-public-review.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.93.2",

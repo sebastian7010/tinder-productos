@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { motion, useMotionValue, useTransform } from "framer-motion";
-import { supabase } from "./supabase";
+import { startTransition, useCallback, useEffect, useMemo, useState } from "react";
+import { AnimatePresence, animate, motion, useMotionValue, useTransform } from "framer-motion";
 
 function qparam(name) {
   const u = new URL(window.location.href);
@@ -17,6 +16,26 @@ function makeReviewerId() {
   return v;
 }
 
+function isInvalidTitle(value) {
+  const text = `${value || ""}`.replace(/\s+/g, " ").trim();
+  if (!text) return true;
+
+  return /^(error|not found|page not found|product not available|access denied|forbidden|bad request)$/i.test(text);
+}
+
+function getReferenceLabel(raw) {
+  if (typeof raw?.referencia === "string" && raw.referencia.trim()) {
+    return raw.referencia.trim();
+  }
+
+  if (typeof raw?.descripcion === "string" && raw.descripcion.includes("|")) {
+    const [reference] = raw.descripcion.split("|");
+    return reference.trim();
+  }
+
+  return "";
+}
+
 function normalizeItem(raw, idx) {
   const imgsRaw = raw.imagenes ?? raw.images ?? [];
   const images = (Array.isArray(imgsRaw) ? imgsRaw : [])
@@ -29,15 +48,112 @@ function normalizeItem(raw, idx) {
     })
     .filter(Boolean);
 
+  const referencia = getReferenceLabel(raw);
+  const rawName = raw.nombre || raw.titulo || raw.title || "";
+  const nombre = isInvalidTitle(rawName) ? referencia : rawName;
+
   return {
     id: String(raw.id ?? raw.itemId ?? raw.url ?? `idx_${idx}`),
     session_id: String(raw.session_id ?? ""),
-    url: raw.url || raw.link || "",
-    nombre: raw.nombre || raw.titulo || raw.title || "",
+    url: raw.url_producto || raw.url || raw.link || "",
+    image_original_url: raw.url_imagen_origen || raw.meta?.remote_image || "",
+    nombre,
     precio: raw.precio || raw.price || "",
     descripcion: raw.descripcion || raw.description || "",
     imagenes: images,
+    referencia,
+    fuente: raw.fuente || raw.source || "",
   };
+}
+
+function normalizeCatalog(sourceData) {
+  const source = Array.isArray(sourceData)
+    ? sourceData
+    : Array.isArray(sourceData?.productos)
+      ? sourceData.productos
+      : [];
+
+  const seen = new Set();
+  const items = [];
+
+  source.forEach((raw, idx) => {
+    const normalized = normalizeItem(raw, idx);
+    if (!normalized.id || seen.has(normalized.id)) return;
+
+    seen.add(normalized.id);
+    items.push({
+      id: normalized.id,
+      url: normalized.url,
+      nombre: normalized.nombre,
+      referencia: normalized.referencia,
+      fuente: normalized.fuente,
+      precio: normalized.precio,
+      descripcion: normalized.descripcion,
+      images: normalized.imagenes,
+      imageOriginalUrl: normalized.image_original_url,
+      raw: normalized,
+    });
+  });
+
+  return items;
+}
+
+async function fetchLocalCatalog() {
+  const response = await fetch("/productos-imagenes-unicas.json", { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`No se pudo leer el catalogo local de imagenes unicas (${response.status})`);
+  }
+
+  const data = await response.json();
+  return normalizeCatalog(data);
+}
+
+function decisionStorageKey(sessionId, reviewerId) {
+  return `decisions_local_v1:${sessionId}:${reviewerId}`;
+}
+
+function readStoredDecisions(sessionId, reviewerId) {
+  try {
+    const raw = localStorage.getItem(decisionStorageKey(sessionId, reviewerId));
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredDecisions(sessionId, reviewerId, decisions) {
+  localStorage.setItem(decisionStorageKey(sessionId, reviewerId), JSON.stringify(decisions));
+}
+
+async function readRemoteDecisions(sessionId, reviewerId) {
+  const response = await fetch(
+    `/api/session-state?session=${encodeURIComponent(sessionId)}&reviewer=${encodeURIComponent(reviewerId)}`,
+    { cache: "no-store" },
+  );
+
+  if (!response.ok) {
+    throw new Error(`API ${response.status}`);
+  }
+
+  const payload = await response.json();
+  return payload && typeof payload.decisions === "object" ? payload.decisions : {};
+}
+
+async function syncRemoteDecisions(sessionId, reviewerId, decisions) {
+  const response = await fetch("/api/session-state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId,
+      reviewerId,
+      decisions,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`API ${response.status}`);
+  }
 }
 
 function downloadJson(filename, data) {
@@ -51,413 +167,494 @@ function downloadJson(filename, data) {
   URL.revokeObjectURL(a.href);
 }
 
-async function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function slugify(value) {
+  return `${value || ""}`
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "session";
+}
+
+function createExportFilename(sessionId, reviewerId, decisionKind) {
+  const sessionSlug = slugify(sessionId);
+  const suffix = decisionKind === "keep" ? "aceptados" : "rechazados";
+  return `${sessionSlug}-${reviewerId}-${suffix}.json`;
+}
+
+function getActionTarget(action) {
+  if (action === "accept") return Math.max(window.innerWidth * 0.9, 380);
+  return -Math.max(window.innerWidth * 0.9, 380);
 }
 
 export default function App() {
-  // session para compartir con tu amigo:
-  // https://tuweb.com/?session=herramientas-bogota
   const [sessionId, setSessionId] = useState(() => qparam("session") || "herramientas-bogota");
-
   const reviewerId = useMemo(() => makeReviewerId(), []);
-
-  const [authUser, setAuthUser] = useState(null);
-  const [email, setEmail] = useState("");
-  const [pass, setPass] = useState("");
 
   const [items, setItems] = useState([]);
   const [index, setIndex] = useState(0);
-
+  const [imageIndex, setImageIndex] = useState(0);
   const [accepted, setAccepted] = useState(() => new Set());
   const [rejected, setRejected] = useState(() => new Set());
   const [history, setHistory] = useState([]);
-
   const [loading, setLoading] = useState(false);
-  const fileRef = useRef(null);
+  const [showPanel, setShowPanel] = useState(false);
+  const [isTransitioning, setIsTransitioning] = useState(false);
+  const [persistenceMode, setPersistenceMode] = useState("local");
 
-  // Swipe motion
   const x = useMotionValue(0);
-  const rotate = useTransform(x, [-250, 0, 250], [-10, 0, 10]);
-  const opacity = useTransform(x, [-250, 0, 250], [0.85, 1, 0.85]);
+  const rotate = useTransform(x, [-280, 0, 280], [-12, 0, 12]);
+  const opacity = useTransform(x, [-280, 0, 280], [0.8, 1, 0.8]);
+  const MotionDiv = motion.div;
 
   const current = items[index] || null;
+  const currentTitle = current?.referencia || current?.nombre || "(sin nombre)";
   const remaining = useMemo(() => Math.max(0, items.length - index), [items.length, index]);
+  const progress = useMemo(() => {
+    if (!items.length) return 0;
+    return Math.round(((items.length - remaining) / items.length) * 100);
+  }, [items.length, remaining]);
+  const currentImage = current?.images?.[imageIndex] || null;
+  const currentImageOpenUrl = current?.imageOriginalUrl || currentImage || current?.url || "";
+  const shareUrl = `${window.location.origin}${window.location.pathname}?session=${encodeURIComponent(sessionId)}`;
+  const isLocalOnlyHost = /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
 
-  // Auth state
-  useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => setAuthUser(data?.user ?? null));
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-      setAuthUser(s?.user ?? null);
-    });
-    return () => sub.subscription.unsubscribe();
-  }, []);
-
-  // Load products for session
-  async function loadProducts() {
+  const loadProducts = useCallback(async () => {
     setLoading(true);
     try {
-      const { data, error } = await supabase
-        .from("products")
-        .select("id, url, nombre, precio, descripcion, imagenes")
-        .eq("session_id", sessionId)
-        .order("created_at", { ascending: true })
-        .limit(5000);
+      const catalog = await fetchLocalCatalog();
+      let stored = {};
+      let mode = "local";
 
-      if (error) throw error;
+      try {
+        stored = await readRemoteDecisions(sessionId, reviewerId);
+        writeStoredDecisions(sessionId, reviewerId, stored);
+        mode = "server";
+      } catch {
+        stored = readStoredDecisions(sessionId, reviewerId);
+      }
 
-      const arr = (data || []).map((r, idx) => ({
-        id: r.id,
-        url: r.url || "",
-        nombre: r.nombre || "",
-        precio: r.precio || "",
-        descripcion: r.descripcion || "",
-        images: Array.isArray(r.imagenes) ? r.imagenes : [],
-        raw: r,
-      }));
+      const acceptedIds = Object.keys(stored).filter((id) => stored[id] === "keep");
+      const rejectedIds = Object.keys(stored).filter((id) => stored[id] === "drop");
+      const firstPendingIndex = catalog.findIndex((item) => !stored[item.id]);
 
-      setItems(arr);
-      setIndex(0);
-      setAccepted(new Set());
-      setRejected(new Set());
-      setHistory([]);
+      startTransition(() => {
+        setItems(catalog);
+        setIndex(firstPendingIndex === -1 ? catalog.length : firstPendingIndex);
+        setAccepted(new Set(acceptedIds));
+        setRejected(new Set(rejectedIds));
+        setHistory([]);
+        setImageIndex(0);
+        setPersistenceMode(mode);
+      });
+      x.set(0);
     } catch (e) {
-      alert("No pude cargar productos de Supabase para session=" + sessionId);
+      alert("No pude cargar los productos locales.");
       console.error(e);
     } finally {
       setLoading(false);
     }
-  }
+  }, [reviewerId, sessionId, x]);
 
   useEffect(() => {
     loadProducts();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [loadProducts]);
 
-  // --- decisiones a Supabase (upsert)
-  async function saveDecision(productId, decision) {
-    const payload = {
-      session_id: sessionId,
-      product_id: productId,
-      reviewer_id: reviewerId,
-      decision,
-      updated_at: new Date().toISOString(),
-    };
-
-    // returning: minimal para no requerir SELECT
-    const { error } = await supabase.from("decisions").upsert(payload, {
-      onConflict: "session_id,product_id,reviewer_id",
-      returning: "minimal",
-    });
-
-    if (error) console.error("saveDecision error:", error);
-  }
-
-  function next() {
-    setIndex((i) => Math.min(items.length, i + 1));
+  useEffect(() => {
+    setImageIndex(0);
     x.set(0);
+  }, [current?.id, x]);
+
+  function saveDecision(productId, decision) {
+    const stored = readStoredDecisions(sessionId, reviewerId);
+    stored[productId] = decision;
+    writeStoredDecisions(sessionId, reviewerId, stored);
+    syncRemoteDecisions(sessionId, reviewerId, stored)
+      .then(() => setPersistenceMode("server"))
+      .catch(() => setPersistenceMode("local"));
   }
 
-  async function doAction(action) {
-    if (!current) return;
-    const id = current.id;
-
-    setHistory((h) => [...h, { id, action }]);
-
-    if (action === "accept") {
-      setAccepted((s) => new Set([...s, id]));
-      setRejected((s) => {
-        const ns = new Set(s);
-        ns.delete(id);
-        return ns;
-      });
-      saveDecision(id, "keep");
-    } else {
-      setRejected((s) => new Set([...s, id]));
-      setAccepted((s) => {
-        const ns = new Set(s);
-        ns.delete(id);
-        return ns;
-      });
-      saveDecision(id, "drop");
-    }
-
-    next();
-  }
-
-  function undo() {
-    setHistory((h) => {
-      if (!h.length) return h;
-      const last = h[h.length - 1];
-      setIndex((i) => Math.max(0, i - 1));
-
-      if (last.action === "accept") {
-        setAccepted((s) => {
-          const ns = new Set(s);
-          ns.delete(last.id);
-          return ns;
-        });
-      } else {
-        setRejected((s) => {
-          const ns = new Set(s);
-          ns.delete(last.id);
-          return ns;
-        });
-      }
-      // Nota: NO revertimos en DB (simple). Si quieres, lo hacemos.
-      return h.slice(0, -1);
-    });
+  function removeStoredDecision(productId) {
+    const stored = readStoredDecisions(sessionId, reviewerId);
+    delete stored[productId];
+    writeStoredDecisions(sessionId, reviewerId, stored);
+    syncRemoteDecisions(sessionId, reviewerId, stored)
+      .then(() => setPersistenceMode("server"))
+      .catch(() => setPersistenceMode("local"));
   }
 
   function resetLocal() {
-    if (!confirm("¿Restablecer solo en este dispositivo? (no borra Supabase)")) return;
+    if (!confirm("Restablecer solo en este dispositivo?")) return;
+    localStorage.removeItem(decisionStorageKey(sessionId, reviewerId));
+    syncRemoteDecisions(sessionId, reviewerId, {})
+      .then(() => setPersistenceMode("server"))
+      .catch(() => setPersistenceMode("local"));
     setIndex(0);
     setAccepted(new Set());
     setRejected(new Set());
     setHistory([]);
+    setImageIndex(0);
+    x.set(0);
   }
 
-  // Upload JSON (ADMIN)
-  async function uploadJsonToSupabase(file) {
-    if (!authUser) {
-      alert("Debes iniciar sesión como admin para subir el JSON.");
-      return;
-    }
-    setLoading(true);
-    try {
-      const text = await file.text();
-      const parsed = JSON.parse(text);
-      if (!Array.isArray(parsed)) {
-        alert("El JSON debe ser un array [ {...}, {...} ]");
-        return;
-      }
+  function getDecisionItems(decisionKind) {
+    const selected = decisionKind === "keep" ? accepted : rejected;
+    return items.filter((it) => selected.has(it.id)).map((it) => it.raw);
+  }
 
-      // Normaliza + asigna session_id
-      const normalized = parsed.map((p, idx) => {
-        const n = normalizeItem(p, idx);
-        return {
-          ...n,
-          session_id: sessionId,
-        };
+  function exportDecisions(decisionKind) {
+    const out = getDecisionItems(decisionKind);
+    downloadJson(createExportFilename(sessionId, reviewerId, decisionKind), out);
+  }
+
+  function exportAllDecisions() {
+    exportDecisions("keep");
+    exportDecisions("drop");
+  }
+
+  function applyDecisionState(id, action) {
+    setHistory((prev) => [...prev, { id, action }]);
+
+    if (action === "accept") {
+      setAccepted((prev) => new Set([...prev, id]));
+      setRejected((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
       });
+      return;
+    }
 
-      // Dedup por id (primero gana)
-      const seen = new Set();
-      const dedup = [];
-      for (const it of normalized) {
-        if (!it.id) continue;
-        if (seen.has(it.id)) continue;
-        seen.add(it.id);
-        dedup.push(it);
+    setRejected((prev) => new Set([...prev, id]));
+    setAccepted((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }
+
+  async function shareSession() {
+    if (isLocalOnlyHost) {
+      alert("El link actual usa localhost y solo funciona en este dispositivo. Para que tu amigo entre desde Bogota, debes publicar la web en un dominio real o usar un tunel.");
+      return;
+    }
+
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: "Tinder de productos",
+          text: `Revisa esta sesion: ${sessionId}`,
+          url: shareUrl,
+        });
+        return;
+      } catch {
+        // Si el usuario cancela, caemos al portapapeles.
       }
+    }
 
-      // Insert por chunks
-      const chunkSize = 500;
-      for (let i = 0; i < dedup.length; i += chunkSize) {
-        const chunk = dedup.slice(i, i + chunkSize).map((it) => ({
-          id: it.id,
-          session_id: it.session_id,
-          url: it.url,
-          nombre: it.nombre,
-          precio: it.precio,
-          descripcion: it.descripcion,
-          imagenes: it.imagenes,
-        }));
-
-        const { error } = await supabase.from("products").insert(chunk);
-        if (error) throw error;
-
-        await sleep(250);
-      }
-
-      alert(`Listo: subidos ${dedup.length} productos a session=${sessionId}`);
-      await loadProducts();
-    } catch (e) {
-      console.error(e);
-      alert("Error subiendo JSON. Mira consola.");
-    } finally {
-      setLoading(false);
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      alert("Link copiado al portapapeles.");
+    } catch {
+      alert(`Comparte este link:\n${shareUrl}`);
     }
   }
 
-  // Export (ADMIN): toma TODAS las decisiones de TODOS los reviewers
-  async function exportDecisions(decisionKind) {
-    if (!authUser) {
-      alert("Solo admin puede exportar.");
-      return;
-    }
-    setLoading(true);
+  async function doAction(action) {
+    if (!current || isTransitioning) return;
+
+    const id = current.id;
+    const direction = action === "accept" ? "keep" : "drop";
+
+    setIsTransitioning(true);
+
     try {
-      const { data: decs, error } = await supabase
-        .from("decisions")
-        .select("product_id, decision, reviewer_id, updated_at")
-        .eq("session_id", sessionId);
-
-      if (error) throw error;
-
-      // Estrategia: si ANY reviewer marcó keep -> keep. Si no, drop.
-      const map = new Map(); // product_id -> {keepCount, dropCount}
-      for (const d of decs || []) {
-        const entry = map.get(d.product_id) || { keep: 0, drop: 0 };
-        if (d.decision === "keep") entry.keep++;
-        else entry.drop++;
-        map.set(d.product_id, entry);
-      }
-
-      const out = [];
-      for (const it of items) {
-        const stat = map.get(it.id) || { keep: 0, drop: 0 };
-        const final = stat.keep > 0 ? "keep" : stat.drop > 0 ? "drop" : "none";
-        if (decisionKind === "keep" && final === "keep") out.push(it.raw);
-        if (decisionKind === "drop" && final === "drop") out.push(it.raw);
-      }
-
-      downloadJson(decisionKind === "keep" ? "aceptados.json" : "rechazados.json", out);
-    } catch (e) {
-      console.error(e);
-      alert("Error exportando. Mira consola.");
-    } finally {
-      setLoading(false);
+      await animate(x, getActionTarget(action), {
+        type: "spring",
+        stiffness: 480,
+        damping: 34,
+        mass: 0.55,
+      }).finished;
+    } catch {
+      // Si la animacion se interrumpe, igual avanzamos.
     }
+
+    startTransition(() => {
+      applyDecisionState(id, action);
+      setIndex((prev) => Math.min(items.length, prev + 1));
+      setImageIndex(0);
+    });
+
+    saveDecision(id, direction);
+    x.set(0);
+    setIsTransitioning(false);
+  }
+
+  function undo() {
+    if (isTransitioning) return;
+
+    setHistory((prev) => {
+      if (!prev.length) return prev;
+      const last = prev[prev.length - 1];
+
+      if (last.action === "accept") {
+        setAccepted((setValue) => {
+          const next = new Set(setValue);
+          next.delete(last.id);
+          return next;
+        });
+      } else {
+        setRejected((setValue) => {
+          const next = new Set(setValue);
+          next.delete(last.id);
+          return next;
+        });
+      }
+
+      removeStoredDecision(last.id);
+      setIndex((prevIndex) => Math.max(0, prevIndex - 1));
+      setImageIndex(0);
+      x.set(0);
+
+      return prev.slice(0, -1);
+    });
   }
 
   function onDragEnd(_, info) {
+    if (isTransitioning) return;
+
     const dx = info.offset.x;
-    if (dx > 140) doAction("accept");
-    else if (dx < -140) doAction("reject");
-    else x.set(0);
+    if (dx > 120) doAction("accept");
+    else if (dx < -120) doAction("reject");
+    else {
+      animate(x, 0, { type: "spring", stiffness: 520, damping: 36, mass: 0.5 });
+    }
   }
 
-  async function adminLogin() {
-    const { error } = await supabase.auth.signInWithPassword({ email, password: pass });
-    if (error) alert("Login error: " + error.message);
-  }
+  function handleImageError() {
+    if (!current?.images?.length) return;
 
-  async function adminLogout() {
-    await supabase.auth.signOut();
+    setImageIndex((prev) => {
+      const nextIndex = prev + 1;
+      return nextIndex < current.images.length ? nextIndex : current.images.length;
+    });
   }
 
   return (
     <div style={styles.page}>
-      <header style={styles.header}>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-          <h2 style={{ margin: 0 }}>Tinder de productos (online)</h2>
-          <span style={styles.badge}>session: <b>{sessionId}</b></span>
-          <span style={styles.badge}>Restantes: {remaining}</span>
-          <span style={styles.badge}>Keep(local): {accepted.size}</span>
-          <span style={styles.badge}>Drop(local): {rejected.size}</span>
-          <span style={styles.badge}>Touch ✅</span>
+      <div style={styles.heroGlow} />
+
+      <div style={styles.topBar}>
+        <div style={styles.topStats}>
+          <span style={styles.statPill}>Restantes: {remaining}</span>
+          <span style={styles.statPill}>Progreso: {progress}%</span>
+          <span style={styles.statPill}>Guardado: {persistenceMode === "server" ? "archivo" : "local"}</span>
         </div>
+        <button style={styles.panelToggle} onClick={() => setShowPanel(true)}>Panel</button>
+      </div>
 
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-          <input
-            value={sessionId}
-            onChange={(e) => setSessionId(e.target.value.trim() || "herramientas-bogota")}
-            style={styles.input}
-            title="Esto define el link para tu amigo: ?session=..."
-          />
+      <AnimatePresence>
+        {showPanel ? (
+          <MotionDiv
+            style={styles.panelOverlay}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setShowPanel(false)}
+          >
+            <MotionDiv
+              style={styles.panelCard}
+              initial={{ y: 24, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: 16, opacity: 0 }}
+              transition={{ duration: 0.18, ease: "easeOut" }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div style={styles.panelHeader}>
+                <div>
+                  <div style={styles.panelTitle}>Panel de control</div>
+                  <div style={styles.panelSub}>Solo para compartir, exportar y reiniciar.</div>
+                </div>
+                <button style={styles.panelClose} onClick={() => setShowPanel(false)}>Cerrar</button>
+              </div>
 
-          {authUser ? (
-            <>
-              <button style={styles.btn} onClick={() => fileRef.current?.click()}>Subir JSON (admin)</button>
-              <input
-                ref={fileRef}
-                type="file"
-                accept="application/json"
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) uploadJsonToSupabase(f);
-                  e.target.value = "";
-                }}
-              />
-              <button style={styles.btn} onClick={() => exportDecisions("keep")}>Exportar aceptados</button>
-              <button style={styles.btn} onClick={() => exportDecisions("drop")}>Exportar rechazados</button>
-              <button style={{ ...styles.btn, background: "#2b2b2b", color: "#fff" }} onClick={adminLogout}>Salir admin</button>
-            </>
-          ) : (
-            <>
-              <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email admin" style={styles.input} />
-              <input value={pass} onChange={(e) => setPass(e.target.value)} placeholder="password" type="password" style={styles.input} />
-              <button style={styles.btn} onClick={adminLogin}>Login admin</button>
-            </>
-          )}
+              <div style={styles.panelGrid}>
+                <div style={styles.panelRow}>
+                  <span style={styles.miniBadge}>Session</span>
+                  <input
+                    value={sessionId}
+                    onChange={(e) => setSessionId(e.target.value.trim() || "herramientas-bogota")}
+                    style={styles.input}
+                    title="Esto separa las decisiones locales por session"
+                  />
+                </div>
 
-          <button style={styles.btn} onClick={undo} disabled={!history.length}>Deshacer</button>
-          <button style={styles.btn} onClick={resetLocal}>Restablecer (local)</button>
-          <button style={styles.btn} onClick={loadProducts}>Recargar</button>
-        </div>
-      </header>
+                <div style={styles.panelStats}>
+                  <span style={styles.badge}>Keep: {accepted.size}</span>
+                  <span style={styles.badge}>Drop: {rejected.size}</span>
+                  <span style={styles.badge}>Restantes: {remaining}</span>
+                  <span style={styles.badge}>Guardado: {persistenceMode === "server" ? "archivo" : "local"}</span>
+                </div>
+
+                <div style={styles.panelActions}>
+                  <button style={styles.btn} onClick={shareSession}>Compartir link</button>
+                  <button style={styles.btn} onClick={exportAllDecisions}>Exportar ambos</button>
+                  <button style={styles.btn} onClick={() => exportDecisions("keep")}>Solo aceptados</button>
+                  <button style={styles.btn} onClick={() => exportDecisions("drop")}>Solo rechazados</button>
+                  <button style={styles.btn} onClick={loadProducts}>Recargar</button>
+                  <button style={styles.btn} onClick={resetLocal}>Restablecer</button>
+                </div>
+
+                {isLocalOnlyHost ? (
+                  <div style={styles.localWarning}>
+                    Ese link usa `localhost`. Fuera de tu equipo no abre. En tu red local usa la IP LAN. Para Bogota, necesitas un dominio real o un tunel.
+                  </div>
+                ) : (
+                  <div style={styles.shareBox}>
+                    <div style={styles.shareLabel}>Link para compartir</div>
+                    <div style={styles.shareUrl}>{shareUrl}</div>
+                  </div>
+                )}
+              </div>
+            </MotionDiv>
+          </MotionDiv>
+        ) : null}
+      </AnimatePresence>
 
       <main style={styles.main}>
         {loading ? (
-          <div style={styles.empty}><h3>Cargando…</h3></div>
+          <div style={styles.empty}>
+            <h3 style={{ marginTop: 0 }}>Cargando...</h3>
+          </div>
         ) : !items.length ? (
           <div style={styles.empty}>
-            <h3>No hay productos en Supabase para esta session</h3>
-            <p>Si eres admin: inicia sesión y sube el productos.json.</p>
-            <p>Si eres tu amigo: revisa que el link tenga el session correcto.</p>
-            <p><b>Ejemplo link:</b> <code>?session=herramientas-bogota</code></p>
+            <h3 style={{ marginTop: 0 }}>No hay productos en el JSON local.</h3>
+            <p>Genera o revisa `public/productos-imagenes-unicas.json`.</p>
+            <p>Comando: <code>npm run catalog:images</code></p>
+            {isLocalOnlyHost ? <p><b>Ojo:</b> `localhost` no le abre a otra persona fuera de tu equipo.</p> : null}
           </div>
         ) : !current ? (
-          <div style={styles.empty}><h3>Listo ✅</h3><p>No hay más productos.</p></div>
+          <div style={styles.empty}>
+            <h3 style={{ marginTop: 0 }}>Revision terminada</h3>
+            <p>Ya no hay mas productos pendientes.</p>
+            <div style={styles.finishActions}>
+              <button style={styles.btnPrimary} onClick={exportAllDecisions}>Descargar ambos JSONs</button>
+              <button style={styles.btn} onClick={() => exportDecisions("keep")}>Solo aceptados</button>
+              <button style={styles.btn} onClick={() => exportDecisions("drop")}>Solo rechazados</button>
+            </div>
+          </div>
         ) : (
-          <div style={styles.cardWrap}>
-            <motion.div
-              drag="x"
-              dragConstraints={{ left: 0, right: 0 }}
-              style={{ ...styles.card, x, rotate, opacity }}
-              onDragEnd={onDragEnd}
-            >
-              <div style={styles.imageArea}>
-                {current.images?.[0] ? (
-                  <img src={current.images[0]} alt="principal" style={styles.imgMain} />
-                ) : (
-                  <div style={styles.noImg}>Sin imagen</div>
-                )}
-              </div>
+          <div style={styles.stage}>
+            <div style={styles.deck}>
+              <div style={styles.ghostCard} />
 
-              <div style={styles.content}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ flex: 1 }}>
-                    <div style={styles.title}>{current.nombre || "(sin nombre)"}</div>
-                    <div style={styles.price}>{current.precio || ""}</div>
-                  </div>
-                  {current.url ? (
-                    <a href={current.url} target="_blank" rel="noreferrer" style={styles.link}>Abrir ↗</a>
-                  ) : null}
+              <MotionDiv
+                key={current.id}
+                drag="x"
+                dragElastic={0.12}
+                dragMomentum={false}
+                dragTransition={{ bounceStiffness: 650, bounceDamping: 30, power: 0.2 }}
+                dragConstraints={{ left: 0, right: 0 }}
+                style={{ ...styles.card, x, rotate, opacity }}
+                onDragEnd={onDragEnd}
+                whileTap={{ scale: 0.995 }}
+              >
+                <div style={styles.imageArea}>
+                  {currentImage ? (
+                    currentImageOpenUrl ? (
+                      <a
+                        href={currentImageOpenUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={styles.imageLink}
+                        title="Abrir imagen en una pestaña nueva"
+                      >
+                        <img
+                          src={currentImage}
+                          alt={currentTitle}
+                          style={styles.imgMain}
+                          onError={handleImageError}
+                          referrerPolicy="no-referrer"
+                          loading="eager"
+                          decoding="async"
+                        />
+                      </a>
+                    ) : (
+                      <img
+                        src={currentImage}
+                        alt={currentTitle}
+                        style={styles.imgMain}
+                        onError={handleImageError}
+                        referrerPolicy="no-referrer"
+                        loading="eager"
+                        decoding="async"
+                      />
+                    )
+                  ) : (
+                    <div style={styles.noImg}>
+                      <div>Sin imagen disponible</div>
+                      {current.url ? (
+                        <a href={current.url} target="_blank" rel="noreferrer" style={styles.noImgLink}>
+                          Abrir producto
+                        </a>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
 
-                {current.descripcion ? <div style={styles.desc}>{current.descripcion}</div> : null}
-
-                {current.images?.length > 1 ? (
-                  <div style={styles.thumbs}>
-                    {current.images.slice(0, 10).map((u, i) => (
-                      <img key={i} src={u} alt={`thumb-${i}`} style={styles.thumb} />
-                    ))}
-                    {current.images.length > 10 ? <span style={styles.more}>+{current.images.length - 10}</span> : null}
+                <div style={styles.content}>
+                  <div style={styles.contentTop}>
+                    <div>
+                      <div style={styles.title}>{currentTitle}</div>
+                      {current.precio ? <div style={styles.metaRow}><span style={styles.price}>{current.precio}</span></div> : null}
+                    </div>
+                    <div style={styles.linkRow}>
+                      {currentImageOpenUrl ? (
+                        <a href={currentImageOpenUrl} target="_blank" rel="noreferrer" style={styles.link}>Imagen</a>
+                      ) : null}
+                      {current.url ? (
+                        <a href={current.url} target="_blank" rel="noreferrer" style={styles.link}>Abrir</a>
+                      ) : null}
+                    </div>
                   </div>
-                ) : null}
-              </div>
+                </div>
+              </MotionDiv>
+            </div>
 
-              <div style={styles.hint}>
-                <span>⬅ Descarta</span>
-                <span>Swipe (touch)</span>
-                <span>Guarda ➡</span>
-              </div>
-            </motion.div>
-
-            <div style={styles.actions}>
-              <button onClick={() => doAction("reject")} style={{ ...styles.actionBtn, background: "#ffefef" }}>
-                ⬅ No
+            <div style={styles.actionDock}>
+              <button
+                onClick={() => doAction("reject")}
+                disabled={isTransitioning}
+                style={{ ...styles.actionCircle, ...styles.rejectBtn, opacity: isTransitioning ? 0.55 : 1 }}
+                aria-label="No lo tiene"
+              >
+                X
               </button>
-              <button onClick={() => doAction("accept")} style={{ ...styles.actionBtn, background: "#effff1" }}>
-                Sí ➡
+
+              <button
+                onClick={undo}
+                disabled={!history.length || isTransitioning}
+                style={{ ...styles.actionCircle, ...styles.undoBtn, opacity: !history.length || isTransitioning ? 0.45 : 1 }}
+                aria-label="Rebobinar"
+              >
+                UNDO
+              </button>
+
+              <button
+                onClick={() => doAction("accept")}
+                disabled={isTransitioning}
+                style={{ ...styles.actionCircle, ...styles.acceptBtn, opacity: isTransitioning ? 0.55 : 1 }}
+                aria-label="Si lo tiene"
+              >
+                OK
               </button>
             </div>
 
-            <div style={{ marginTop: 10, fontSize: 12, color: "#666" }}>
-              Link para tu amigo: <b>{window.location.origin}{window.location.pathname}?session={encodeURIComponent(sessionId)}</b>
+            <div style={styles.actionLabels}>
+              <span>No lo tiene</span>
+              <span>Rebobinar</span>
+              <span>Si lo tiene</span>
             </div>
           </div>
         )}
@@ -467,31 +664,285 @@ export default function App() {
 }
 
 const styles = {
-  page: { minHeight: "100vh", fontFamily: "system-ui, Segoe UI, Roboto, Arial", background: "#f6f6f6", color: "#111" },
-  header: { padding: 14, display: "flex", flexDirection: "column", gap: 10,
-    borderBottom: "1px solid #e5e5e5", background: "#fff", position: "sticky", top: 0, zIndex: 10 },
-  badge: { fontSize: 12, padding: "6px 10px", borderRadius: 999, background: "#f1f1f1" },
-  btn: { padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "#fff", cursor: "pointer" },
-  input: { padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", minWidth: 220 },
-  main: { padding: 22, display: "flex", justifyContent: "center" },
-  empty: { maxWidth: 700, padding: 24, borderRadius: 16, background: "#fff", border: "1px solid #e7e7e7" },
-  cardWrap: { width: 520, maxWidth: "95vw" },
-  card: { background: "#fff", borderRadius: 22, border: "1px solid #e7e7e7", overflow: "hidden",
-    boxShadow: "0 10px 30px rgba(0,0,0,0.06)", cursor: "grab", userSelect: "none" },
-  imageArea: { height: 360, background: "#111", display: "flex", alignItems: "center", justifyContent: "center" },
-  imgMain: { width: "100%", height: "100%", objectFit: "cover", display: "block" },
-  noImg: { color: "#fff", opacity: 0.8 },
-  content: { padding: 14 },
-  title: { fontSize: 18, fontWeight: 700, lineHeight: 1.2 },
-  price: { marginTop: 6, fontSize: 16, fontWeight: 650 },
-  link: { alignSelf: "flex-start", textDecoration: "none", fontSize: 13, padding: "8px 10px",
-    borderRadius: 10, border: "1px solid #ddd", color: "#111", background: "#fff", whiteSpace: "nowrap" },
-  desc: { marginTop: 10, fontSize: 13, lineHeight: 1.35, color: "#333", maxHeight: 90, overflow: "auto", paddingRight: 6 },
-  thumbs: { marginTop: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
-  thumb: { width: 54, height: 54, objectFit: "cover", borderRadius: 12, border: "1px solid #eee" },
-  more: { fontSize: 12, padding: "6px 10px", borderRadius: 999, background: "#f1f1f1" },
-  hint: { display: "flex", justifyContent: "space-between", padding: "10px 14px", fontSize: 12, color: "#666",
-    borderTop: "1px solid #f0f0f0", background: "#fafafa" },
-  actions: { marginTop: 12, display: "flex", gap: 12, justifyContent: "space-between" },
-  actionBtn: { flex: 1, padding: "12px 14px", borderRadius: 16, border: "1px solid #e7e7e7", cursor: "pointer", fontWeight: 700 },
+  page: {
+    minHeight: "100vh",
+    fontFamily: "\"Segoe UI\", Tahoma, sans-serif",
+    background: "linear-gradient(180deg, #eef3f8 0%, #f7f2e9 100%)",
+    color: "#111",
+    position: "relative",
+    overflow: "hidden",
+  },
+  heroGlow: {
+    position: "absolute",
+    inset: "auto -10% 65% auto",
+    width: 320,
+    height: 320,
+    borderRadius: 999,
+    background: "radial-gradient(circle, rgba(31,125,95,0.18) 0%, rgba(31,125,95,0) 70%)",
+    pointerEvents: "none",
+  },
+  topBar: {
+    position: "sticky",
+    top: 0,
+    zIndex: 20,
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "14px 16px 8px",
+    backdropFilter: "blur(8px)",
+  },
+  topStats: { display: "flex", gap: 8, flexWrap: "wrap" },
+  statPill: {
+    fontSize: 12,
+    padding: "8px 12px",
+    borderRadius: 999,
+    background: "rgba(255,255,255,0.76)",
+    border: "1px solid rgba(17,17,17,0.08)",
+    boxShadow: "0 8px 20px rgba(17,17,17,0.04)",
+  },
+  panelToggle: {
+    padding: "10px 14px",
+    borderRadius: 999,
+    border: "1px solid rgba(17,17,17,0.08)",
+    background: "#111",
+    color: "#fff",
+    cursor: "pointer",
+    fontWeight: 700,
+  },
+  panelOverlay: {
+    position: "fixed",
+    inset: 0,
+    zIndex: 40,
+    background: "rgba(17,17,17,0.36)",
+    display: "flex",
+    alignItems: "flex-end",
+    justifyContent: "center",
+    padding: 12,
+  },
+  panelCard: {
+    width: "min(760px, 100%)",
+    borderRadius: 24,
+    background: "#fff",
+    border: "1px solid rgba(17,17,17,0.08)",
+    boxShadow: "0 24px 60px rgba(17,17,17,0.18)",
+    padding: 18,
+  },
+  panelHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    alignItems: "flex-start",
+  },
+  panelTitle: { fontSize: 20, fontWeight: 800 },
+  panelSub: { marginTop: 4, fontSize: 13, color: "#666" },
+  panelClose: {
+    padding: "8px 12px",
+    borderRadius: 999,
+    border: "1px solid #ddd",
+    background: "#fff",
+    cursor: "pointer",
+  },
+  panelGrid: { marginTop: 16, display: "grid", gap: 14 },
+  panelRow: { display: "grid", gap: 8 },
+  miniBadge: { fontSize: 12, fontWeight: 700, color: "#444" },
+  panelStats: { display: "flex", gap: 8, flexWrap: "wrap" },
+  panelActions: { display: "flex", gap: 10, flexWrap: "wrap" },
+  badge: { fontSize: 12, padding: "7px 11px", borderRadius: 999, background: "#f1f3f5" },
+  btn: {
+    padding: "10px 14px",
+    borderRadius: 12,
+    border: "1px solid #ddd",
+    background: "#fff",
+    cursor: "pointer",
+  },
+  btnPrimary: {
+    padding: "11px 16px",
+    borderRadius: 12,
+    border: "1px solid #111",
+    background: "#111",
+    color: "#fff",
+    cursor: "pointer",
+    fontWeight: 700,
+  },
+  input: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid #ddd",
+    minWidth: 220,
+  },
+  shareBox: {
+    padding: 12,
+    borderRadius: 16,
+    background: "#f7faf8",
+    border: "1px solid #dfe9e4",
+  },
+  shareLabel: { fontSize: 12, fontWeight: 700, color: "#3b5647" },
+  shareUrl: {
+    marginTop: 6,
+    fontSize: 12,
+    lineHeight: 1.5,
+    color: "#314338",
+    wordBreak: "break-all",
+  },
+  localWarning: {
+    padding: 12,
+    borderRadius: 16,
+    background: "#fff7e8",
+    border: "1px solid #f0d89a",
+    fontSize: 12,
+    lineHeight: 1.5,
+    color: "#6a4b00",
+  },
+  main: {
+    minHeight: "calc(100vh - 60px)",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: "8px 14px 28px",
+  },
+  empty: {
+    width: "min(560px, 100%)",
+    padding: 24,
+    borderRadius: 24,
+    background: "rgba(255,255,255,0.92)",
+    border: "1px solid rgba(17,17,17,0.08)",
+    boxShadow: "0 20px 50px rgba(17,17,17,0.08)",
+  },
+  finishActions: { marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap" },
+  stage: {
+    width: "min(540px, 100%)",
+    display: "grid",
+    gap: 16,
+    alignItems: "center",
+  },
+  deck: {
+    position: "relative",
+    width: "100%",
+    minHeight: 0,
+    paddingTop: 12,
+  },
+  ghostCard: {
+    position: "absolute",
+    inset: "22px 18px -10px 18px",
+    borderRadius: 28,
+    background: "rgba(255,255,255,0.42)",
+    border: "1px solid rgba(17,17,17,0.05)",
+    transform: "scale(0.98)",
+  },
+  card: {
+    position: "relative",
+    background: "rgba(255,255,255,0.96)",
+    borderRadius: 28,
+    border: "1px solid rgba(17,17,17,0.08)",
+    overflow: "hidden",
+    boxShadow: "0 22px 55px rgba(17,17,17,0.12)",
+    cursor: "grab",
+    userSelect: "none",
+    touchAction: "pan-y",
+    willChange: "transform",
+  },
+  imageArea: {
+    aspectRatio: "1 / 1",
+    maxHeight: "58vh",
+    background: "linear-gradient(180deg, #101515 0%, #1e2424 100%)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  imgMain: {
+    width: "100%",
+    height: "100%",
+    objectFit: "contain",
+    display: "block",
+    background: "#f6f6f6",
+  },
+  imageLink: {
+    display: "block",
+    width: "100%",
+    height: "100%",
+  },
+  noImg: {
+    color: "#fff",
+    opacity: 0.86,
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    alignItems: "center",
+  },
+  noImgLink: { color: "#fff", textDecoration: "underline", fontSize: 13 },
+  content: { padding: 16 },
+  contentTop: { display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" },
+  linkRow: { display: "flex", gap: 8, alignItems: "center" },
+  title: { fontSize: 24, fontWeight: 800, lineHeight: 1.1, letterSpacing: "-0.02em" },
+  metaRow: { marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
+  sourceChip: {
+    fontSize: 12,
+    padding: "6px 10px",
+    borderRadius: 999,
+    background: "#eef4ff",
+    color: "#21406f",
+    textTransform: "capitalize",
+  },
+  price: {
+    fontSize: 13,
+    fontWeight: 700,
+    padding: "6px 10px",
+    borderRadius: 999,
+    background: "#eef9f0",
+    color: "#1b5c32",
+  },
+  referenceLine: { marginTop: 10, fontSize: 13, color: "#555", lineHeight: 1.4 },
+  link: {
+    alignSelf: "flex-start",
+    textDecoration: "none",
+    fontSize: 13,
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid #ddd",
+    color: "#111",
+    background: "#fff",
+    whiteSpace: "nowrap",
+  },
+  actionDock: {
+    display: "grid",
+    gridTemplateColumns: "1fr auto 1fr",
+    gap: 14,
+    alignItems: "center",
+    width: "100%",
+  },
+  actionCircle: {
+    width: "100%",
+    minHeight: 68,
+    borderRadius: 999,
+    border: "none",
+    cursor: "pointer",
+    fontSize: 24,
+    fontWeight: 800,
+    boxShadow: "0 14px 30px rgba(17,17,17,0.10)",
+  },
+  rejectBtn: {
+    background: "linear-gradient(180deg, #fff1f1 0%, #ffd8d8 100%)",
+    color: "#a32929",
+  },
+  undoBtn: {
+    width: 84,
+    minWidth: 84,
+    background: "linear-gradient(180deg, #ffffff 0%, #eef1f4 100%)",
+    color: "#25313b",
+    border: "1px solid rgba(17,17,17,0.08)",
+    fontSize: 12,
+    letterSpacing: "0.08em",
+  },
+  acceptBtn: {
+    background: "linear-gradient(180deg, #f0fff3 0%, #c8f2d1 100%)",
+    color: "#15703f",
+  },
+  actionLabels: {
+    display: "grid",
+    gridTemplateColumns: "1fr auto 1fr",
+    gap: 14,
+    fontSize: 12,
+    color: "#5f6871",
+    textAlign: "center",
+  },
 };
