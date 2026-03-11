@@ -90,6 +90,9 @@ async function loadCatalog(req) {
 
   const origin = getRequestOrigin(req);
   const candidates = [
+    `${origin}/catalogo-finalistas.json`,
+    `${origin}/catalogo-runtime.json`,
+    `${origin}/herramientas-bogota-kevin-aceptados%204.json`,
     `${origin}/productos-imagenes-unicas.json`,
     `${origin}/reciclaje-productos.json`,
   ];

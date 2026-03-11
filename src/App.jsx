@@ -1,6 +1,15 @@
 import { startTransition, useCallback, useEffect, useMemo, useState } from "react";
 import { AnimatePresence, animate, motion, useMotionValue, useTransform } from "framer-motion";
 
+const PRIMARY_CATALOG_PATH = "/catalogo-finalistas.json";
+const CATALOG_CANDIDATES = [
+  PRIMARY_CATALOG_PATH,
+  "/catalogo-runtime.json",
+  "/herramientas-bogota-kevin-aceptados%204.json",
+  "/productos-imagenes-unicas.json",
+  "/reciclaje-productos.json",
+];
+
 function qparam(name) {
   const u = new URL(window.location.href);
   return u.searchParams.get(name) || "";
@@ -105,13 +114,20 @@ function normalizeCatalog(sourceData) {
 }
 
 async function fetchLocalCatalog() {
-  const response = await fetch("/productos-imagenes-unicas.json", { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`No se pudo leer el catalogo local de imagenes unicas (${response.status})`);
+  for (const candidate of CATALOG_CANDIDATES) {
+    try {
+      const response = await fetch(candidate, { cache: "no-store" });
+      if (!response.ok) continue;
+
+      const data = await response.json();
+      const normalized = normalizeCatalog(data);
+      if (normalized.length) return normalized;
+    } catch {
+      // Probamos el siguiente candidato.
+    }
   }
 
-  const data = await response.json();
-  return normalizeCatalog(data);
+  throw new Error(`No se pudo leer el catalogo local (${CATALOG_CANDIDATES.join(", ")})`);
 }
 
 function decisionStorageKey(sessionId, reviewerId) {
@@ -195,7 +211,7 @@ function getActionTarget(action) {
 }
 
 export default function App() {
-  const [sessionId, setSessionId] = useState(() => qparam("session") || "herramientas-bogota");
+  const [sessionId, setSessionId] = useState(() => qparam("session") || "finalistas-bogota");
   const reviewerId = useMemo(() => resolveReviewerId(), []);
 
   const [items, setItems] = useState([]);
@@ -556,8 +572,8 @@ export default function App() {
         ) : !items.length ? (
           <div style={styles.empty}>
             <h3 style={{ marginTop: 0 }}>No hay productos en el JSON local.</h3>
-            <p>Genera o revisa `public/productos-imagenes-unicas.json`.</p>
-            <p>Comando: <code>npm run catalog:images</code></p>
+            <p>Revisa `public/catalogo-finalistas.json`.</p>
+            <p>Comando: <code>npm run catalog:finalistas</code></p>
             {isLocalOnlyHost ? <p><b>Ojo:</b> `localhost` no le abre a otra persona fuera de tu equipo.</p> : null}
           </div>
         ) : !current ? (

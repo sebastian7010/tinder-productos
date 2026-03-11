@@ -187,6 +187,12 @@ async function loadCatalog() {
 
 async function findCatalogFile() {
   const candidates = [
+    path.join(distDir, "catalogo-finalistas.json"),
+    path.join(fallbackPublicDir, "catalogo-finalistas.json"),
+    path.join(distDir, "catalogo-runtime.json"),
+    path.join(fallbackPublicDir, "catalogo-runtime.json"),
+    path.join(distDir, "herramientas-bogota-kevin-aceptados 4.json"),
+    path.join(fallbackPublicDir, "herramientas-bogota-kevin-aceptados 4.json"),
     path.join(distDir, "productos-imagenes-unicas.json"),
     path.join(fallbackPublicDir, "productos-imagenes-unicas.json"),
     path.join(distDir, "reciclaje-productos.json"),
